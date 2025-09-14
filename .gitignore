@@ -3,3 +3,8 @@
 # Bytecode
 __pycache__/
 *.pyc
+
+
+/Data/검증.py
+
+/Data/SamInKorean/
