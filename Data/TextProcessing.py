@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import glob
 import asyncio
 import dotenv
 from concurrent.futures import ThreadPoolExecutor
@@ -270,5 +271,3 @@ if __name__ == "__main__":
     # 나중에 발음 벡터(phn_vec) 추가 시도해도 총합은 O(N·(L² + M·logN)) 스케일 유지됨.
 
     print(end - start)
-
-

@@ -1,0 +1,8 @@
+Gathering diagnostics for ID  into /var/folders/f3/n6fz8x8d23vcrpzm9shwmjlc0000gn/T/24B66A5F-FC5C-4BC5-9C06-A5C6C10708B5/20250919033320.zip.
+This may take up to 15 minutes.
+unable to trigger dns-forwarder diagnostics: Post "http://ipc/diagnostics": dial unix /Users/key_wave_tree/Library/Containers/com.docker.docker/Data/dns-forwarder.sock: connect: no such file or directory
+
+
+Diagnostics Bundle: /var/folders/f3/n6fz8x8d23vcrpzm9shwmjlc0000gn/T/24B66A5F-FC5C-4BC5-9C06-A5C6C10708B5/20250919033320.zip
+Uploaded diagnostics to: https://docker-pinata-support.s3.amazonaws.com/incoming/3/24B66A5F-FC5C-4BC5-9C06-A5C6C10708B5/20250919033320.zip
+Diagnostics ID:     24B66A5F-FC5C-4BC5-9C06-A5C6C10708B5/20250919033320 (uploaded)
