@@ -1,273 +1,846 @@
-import os
-import re
-import json
-import glob
-import asyncio
-import dotenv
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
+"""
+Data/TextProcessing.py
 
-import aiofiles
+완전 통합 버전: VectorDB 자동 구축 + 메모리 관리
 
-# pymilvus 최신 API에 필요한 모듈만 가져옵니다.
-from pymilvus import FieldSchema, CollectionSchema, DataType
-from pymilvus.milvus_client import MilvusClient
+주요 기능:
+1. VectorDB 자동 감지 및 복구 (인덱스 생성/재구축)
+2. 메모리 관리 최적화 (싱글톤, GC, 컨텍스트 매니저)
+3. 메모리 모니터링
+"""
+import gc
+import weakref
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
 from sentence_transformers import SentenceTransformer
+from pymilvus import MilvusClient
+from pymilvus.exceptions import MilvusException
+import psutil
+import os
 
-# --- 1. 기본 설정 ---
-dotenv.load_dotenv(dotenv_path="../.env")
-MILVUS_HOST = os.getenv("MILVUS_HOST")
-MILVUS_PORT = os.getenv("MILVUS_PORT")
-MILVUS_URI = f"http://{MILVUS_HOST}:{MILVUS_PORT}"
+from .SearchEngine import DictionarySearch
 
-DATA_DIR = "SamInKorean"
-COLLECTION_NAME = "semantic_db"
-MODEL_NAME = "jhgan/ko-sbert-nli"
+from .Config import (get_milvus_connection_params, COLLECTION_NAME,
+                    MIN_CONFIDENCE, PRONUNCIATION_WEIGHT)
 
-BATCH_SIZE = 256
-CONCURRENCY_LIMIT = 10
-# 💡 소비자(데이터 삽입) 태스크의 개수 설정
-CONSUMER_COUNT = 2
+# ============================================
+# 싱글톤 벡터 모델 관리자
+# ============================================
+
+class VectorModelManager:
+    """벡터 모델 싱글톤 관리자 (메모리 절약)"""
+    _instance = None
+    _model = None
+    _model_name = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def get_model(self, model_name: str) -> SentenceTransformer:
+        """벡터 모델 가져오기 (싱글톤)"""
+        if self._model is not None and self._model_name == model_name:
+            return self._model
+
+        if self._model is not None:
+            del self._model
+            gc.collect()
+
+        self._model = SentenceTransformer(model_name)
+        self._model_name = model_name
+
+        return self._model
+
+    def clear(self):
+        """모델 메모리 해제"""
+        if self._model is not None:
+            del self._model
+            self._model = None
+            self._model_name = None
+            gc.collect()
 
 
-# --- 2. 비동기 처리 함수들 ---
-def get_json_file_list(origin_path=DATA_DIR) -> list:
-    """지정된 경로와 모든 하위 디렉토리에서 .json 파일의 전체 경로 리스트를 반환합니다."""
-    #search_pattern = os.path.join(origin_path, '**', '*.json')
-    #return glob.glob(search_pattern, recursive=True)
-    test_path = ['SamInKorean/1476785_50000.json']
-    return test_path
+# ============================================
+# 메모리 모니터링
+# ============================================
 
-def _clean_text(t: str) -> str:
-    t = re.sub(r"<[^>]+>", " ", t)      # 태그 제거
-    t = re.sub(r"\{[^}]*\}", " ", t)    # {…} 제거
-    t = re.sub(r"\s+", " ", t)
-    return t.strip()
+def get_process_memory_mb() -> float:
+    """현재 프로세스 메모리 사용량 (MB)"""
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024)
 
-async def producer(file_path: str, queue: asyncio.Queue, semaphore: asyncio.Semaphore):
-    async with semaphore:
+
+def print_memory_usage(label: str = ""):
+    """메모리 사용량 출력"""
+    mem_mb = get_process_memory_mb()
+    print(f"💾 메모리 [{label}]: {mem_mb:.1f}MB")
+
+
+# ============================================
+# 데이터 클래스
+# ============================================
+
+@dataclass
+class CleanedText:
+    """정제된 텍스트 결과"""
+    original_text: str
+    cleaned_text: str
+    confidence: float
+    changes: List[Tuple[str, str]]
+
+
+@dataclass
+class SearchResult:
+    """검색 결과"""
+    word: str
+    definition: str
+    pos: str
+    pronunciation: str
+    semantic_score: float
+    pronunciation_score: float
+    combined_score: float
+    confidence: str
+    similar_words: List[str]
+    parent_words: List[str]
+
+
+# ============================================
+# 완전 통합 TextProcessing
+# ============================================
+
+class TextProcessing:
+    """
+    Dysarthric Speech 텍스트 처리 파이프라인
+
+    통합 기능:
+    1. VectorDB 자동 감지 및 복구
+    2. 메모리 관리 최적화
+    3. 메모리 모니터링
+    """
+
+    # 클래스 레벨 검색 엔진 캐시 (약한 참조)
+    _search_engine_cache = weakref.WeakValueDictionary()
+
+    def __init__(
+        self,
+        verbose: bool = False,
+        auto_build: Optional[bool] = None,
+        monitor_memory: bool = False
+    ):
+        """
+        초기화
+
+        Args:
+            verbose: 상세 로그 출력
+            auto_build: VectorDB 자동 구축 (True/False/None)
+            monitor_memory: 메모리 사용량 모니터링
+        """
+        self.verbose = verbose
+        self.auto_build = auto_build
+        self.monitor_memory = monitor_memory
+
+        if self.monitor_memory:
+            print_memory_usage("초기화 전")
+
+        # 헤더 출력
+        if self.verbose:
+            self._print_header()
+
+        # VectorDB 확인 및 준비
+        self._ensure_vectordb_ready()
+
+        # 검색 엔진 초기화 (재사용)
+        self._init_search_engine()
+
+        # 벡터 모델 관리자
+        self.model_manager = VectorModelManager()
+
+        if self.monitor_memory:
+            print_memory_usage("초기화 후")
+
+    def _init_search_engine(self):
+        """검색 엔진 초기화 (재사용)"""
+        cache_key = "default"
+
+        if cache_key in self._search_engine_cache:
+            self.search_engine = self._search_engine_cache[cache_key]
+            if self.verbose:
+                print("✅ 검색 엔진 재사용 (메모리 절약)\n")
+        else:
+            self.search_engine = DictionarySearch(verbose=self.verbose)
+            self._search_engine_cache[cache_key] = self.search_engine
+            if self.verbose:
+                print("✅ 검색 엔진 초기화 완료\n")
+
+    def __enter__(self):
+        """컨텍스트 매니저 진입"""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """컨텍스트 매니저 종료 (메모리 정리)"""
+        self.cleanup()
+        return False
+
+    def cleanup(self):
+        """메모리 정리"""
+        if self.monitor_memory:
+            print_memory_usage("정리 전")
+
+        gc.collect()
+
+        if self.monitor_memory:
+            print_memory_usage("정리 후")
+
+    # ============================================
+    # VectorDB 관리
+    # ============================================
+
+    def _print_header(self):
+        """헤더 출력"""
+        print("\n" + "="*70)
+        print("🎙️  Dysarthric Speech 텍스트 처리 파이프라인")
+        print("="*70 + "\n")
+
+    def _check_vectordb_exists(self) -> tuple[bool, str]:
+        """
+        VectorDB 컬렉션 및 인덱스 존재 여부 확인
+
+        Returns:
+            (상태, 메시지)
+        """
         try:
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                data = json.loads(await f.read())
 
-            ch = (data.get("channel") or {})
-            items = ch.get("item") or []
-            if isinstance(items, dict):
-                items = [items]
 
-            enq_local = 0
-            for it in items:
-                wi = it.get("wordinfo") or {}
-                word = wi.get("word") or ""
-                s = it.get("senseinfo")
-                senses = s if isinstance(s, list) else ([s] if s else [])
-                for sense in senses:
-                    definition = sense.get("definition") or sense.get("definition_original") or ""
-                    if word and isinstance(definition, str) and definition.strip():
-                        await queue.put({"word": word, "definition": _clean_text(definition)[:2000]})
-                        enq_local += 1
+            conn_params = get_milvus_connection_params()
+            client = MilvusClient(**conn_params)
 
-            if enq_local == 0:
-                print(f"⚠️ {os.path.basename(file_path)}: 파싱 결과 0건")
+            if not client.has_collection(COLLECTION_NAME):
+                if self.verbose:
+                    print(f"⚠️  VectorDB 컬렉션 없음: {COLLECTION_NAME}")
+                return False, "컬렉션없음"
+
+            stats = client.get_collection_stats(COLLECTION_NAME)
+            row_count = stats.get('row_count', 0)
+
+            if row_count == 0:
+                if self.verbose:
+                    print(f"⚠️  컬렉션은 있지만 비어있음: {COLLECTION_NAME}")
+                return False, "데이터없음"
+
+            try:
+                client.load_collection(COLLECTION_NAME)
+
+                if self.verbose:
+                    print(f"✅ VectorDB 확인: {COLLECTION_NAME} ({row_count:,}개 항목)")
+                return True, "완전"
+
+            except MilvusException as e:
+                error_msg = str(e).lower()
+
+                if "index not found" in error_msg:
+                    if self.verbose:
+                        print(f"⚠️  인덱스 없음: {COLLECTION_NAME}")
+                        print(f"   데이터는 있지만 ({row_count:,}개) 인덱스가 생성되지 않음")
+                    return False, "인덱스없음"
+                else:
+                    if self.verbose:
+                        print(f"✅ VectorDB 확인: {COLLECTION_NAME} ({row_count:,}개 항목)")
+                    return True, "완전"
+
+        except MilvusException as e:
+            error_msg = str(e).lower()
+            if "collection not found" in error_msg:
+                if self.verbose:
+                    print(f"⚠️  VectorDB 컬렉션 없음")
+                return False, "컬렉션없음"
+            else:
+                if self.verbose:
+                    print(f"⚠️  Milvus 연결 실패: {e}")
+                return False, "에러"
+
         except Exception as e:
-            print(f"파일 처리 오류 {file_path}: {e}")
+            if self.verbose:
+                print(f"⚠️  VectorDB 확인 중 에러: {e}")
+            return False, "에러"
 
+    def _ask_user_for_index_fix(self) -> str:
+        """인덱스 없는 경우 사용자에게 물어보기"""
+        print("\n" + "="*70)
+        print("🔧 VectorDB 복구 필요")
+        print("="*70)
+        print("\n📊 현재 상태:")
+        print("   • 컬렉션: 존재 ✅")
+        print("   • 데이터: 존재 ✅")
+        print("   • 인덱스: 없음 ❌")
+        print("\n💡 해결 방법:")
+        print("   1. 인덱스만 생성 (빠름, 5-10분)")
+        print("   2. 삭제 후 재구축 (느림, 80-100분)")
+        print("\n" + "="*70)
 
-def vectorize_batch(model, definitions):
-    """CPU-bound 작업인 벡터 변환을 수행하는 동기 함수입니다."""
-    return model.encode(definitions, show_progress_bar=False, batch_size=BATCH_SIZE).tolist()
+        while True:
+            response = input("\n🤔 어떻게 하시겠습니까? (1=인덱스생성/2=재구축/n=건너뜀): ").strip().lower()
 
+            if response in ['1', 'index', 'i']:
+                return "index"
+            elif response in ['2', 'rebuild', 'r']:
+                return "rebuild"
+            elif response in ['n', 'no', 'skip', 's', '아니오', 'ㄴ']:
+                return "skip"
+            else:
+                print("   ⚠️  '1', '2', 또는 'n'을 입력해주세요.")
 
-async def consumer(name: str, queue: asyncio.Queue, milvus_client: MilvusClient, model: SentenceTransformer,
-                   executor: ThreadPoolExecutor):
-    """큐에서 데이터를 가져와 배치 단위로 벡터화하고 Milvus에 삽입합니다."""
-    processed_count = 0
-    while True:
+    def _create_index_only(self) -> bool:
+        """기존 데이터에 인덱스만 생성"""
+        print("\n" + "="*70)
+        print("🔨 인덱스 생성 시작")
+        print("="*70 + "\n")
+
         try:
-            # 💡 [핵심 수정] 첫 아이템은 큐에 데이터가 들어올 때까지 기다립니다.
-            item = await queue.get()
-            if item is None:  # 종료 신호(None)를 받으면 루프를 탈출합니다.
-                break
+            import sys
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
 
-            batch_data = [item]
-            queue.task_done()
-
-            # 💡 [핵심 수정] 큐에 남은 데이터를 최대한 BATCH_SIZE까지 채웁니다.
-            while len(batch_data) < BATCH_SIZE:
+            try:
+                from VectorBuilder import VectorDBBuilder
+            except ImportError:
                 try:
-                    # get_nowait()은 큐가 비어있으면 즉시 예외를 발생시킵니다.
-                    item = queue.get_nowait()
-                    if item is None:
-                        # 만약 배치 중간에 종료 신호를 만나면, 다른 consumer를 위해 다시 큐에 넣습니다.
-                        await queue.put(None)
-                        break
-                    batch_data.append(item)
-                    queue.task_done()
-                except asyncio.QueueEmpty:
-                    # 큐가 비었으면 현재까지 모인 데이터로 처리를 진행합니다.
-                    break
+                    from VectorBuilder_MEMORY_OPT import VectorDBBuilder
+                except ImportError:
+                    print("❌ VectorBuilder를 찾을 수 없습니다")
+                    return False
 
-            # --- 데이터 처리 로직 (이전과 동일) ---
-            words = [d['word'] for d in batch_data]
-            definitions = [d['definition'] for d in batch_data]
+            builder = VectorDBBuilder()
+            builder.connect()
+            builder.initialize_model()
 
-            vectors = await asyncio.get_running_loop().run_in_executor(
-                executor, vectorize_batch, model, definitions
+            print("🔨 인덱스 생성 중...")
+            builder.create_index()
+
+            print("\n" + "="*70)
+            print("✅ 인덱스 생성 완료!")
+            print("="*70 + "\n")
+
+            return True
+
+        except Exception as e:
+            print("\n" + "="*70)
+            print("❌ 인덱스 생성 실패")
+            print("="*70)
+            print(f"\n에러: {e}")
+            print("\n💡 대안:")
+            print("   삭제 후 재구축을 시도하세요")
+            print("\n" + "="*70 + "\n")
+
+            import traceback
+            if self.verbose:
+                print("\n상세 에러:")
+                traceback.print_exc()
+
+            return False
+
+    def _delete_and_rebuild(self) -> bool:
+        """기존 컬렉션 삭제 후 재구축"""
+        print("\n" + "="*70)
+        print("🗑️  기존 VectorDB 삭제 후 재구축")
+        print("="*70 + "\n")
+
+        try:
+            import sys
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+
+            try:
+                from VectorBuilder import VectorDBBuilder
+            except ImportError:
+                try:
+                    from VectorBuilder_MEMORY_OPT import VectorDBBuilder
+                except ImportError:
+                    print("❌ VectorBuilder를 찾을 수 없습니다")
+                    return False
+
+            import multiprocessing as mp
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass
+
+            builder = VectorDBBuilder()
+
+            print("🗑️  기존 컬렉션 삭제 중...")
+            builder.delete_collection()
+            print("✅ 삭제 완료\n")
+
+            print("🔨 VectorDB 재구축 시작...\n")
+
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = [None]
+                error = [None]
+
+                def run_in_thread():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        new_loop.run_until_complete(builder.build())
+                        new_loop.close()
+                        result[0] = True
+                    except Exception as e:
+                        error[0] = e
+
+                thread = threading.Thread(target=run_in_thread)
+                thread.start()
+                thread.join()
+
+                if error[0]:
+                    raise error[0]
+
+            except RuntimeError:
+                asyncio.run(builder.build())
+
+            print("\n" + "="*70)
+            print("✅ VectorDB 재구축 완료!")
+            print("="*70 + "\n")
+
+            return True
+
+        except Exception as e:
+            print("\n" + "="*70)
+            print("❌ VectorDB 재구축 실패")
+            print("="*70)
+            print(f"\n에러: {e}")
+            print("\n💡 수동 구축:")
+            print("   python -m Data.VectorBuilder")
+            print("\n" + "="*70 + "\n")
+
+            import traceback
+            if self.verbose:
+                print("\n상세 에러:")
+                traceback.print_exc()
+
+            return False
+
+    def _build_vectordb(self) -> bool:
+        """VectorDB 새로 구축"""
+        print("\n" + "="*70)
+        print("🔨 VectorDB 자동 구축 시작")
+        print("="*70 + "\n")
+
+        try:
+            import sys
+            current_dir = os.path.dirname(os.path.abspath(__file__))
+            if current_dir not in sys.path:
+                sys.path.insert(0, current_dir)
+
+            try:
+                from VectorBuilder import VectorDBBuilder
+            except ImportError:
+                try:
+                    from VectorBuilder_MEMORY_OPT import VectorDBBuilder
+                except ImportError:
+                    print("❌ VectorBuilder를 찾을 수 없습니다")
+                    return False
+
+            import multiprocessing as mp
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass
+
+            builder = VectorDBBuilder()
+
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+                import threading
+                result = [None]
+                error = [None]
+
+                def run_in_thread():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        new_loop.run_until_complete(builder.build())
+                        new_loop.close()
+                        result[0] = True
+                    except Exception as e:
+                        error[0] = e
+
+                thread = threading.Thread(target=run_in_thread)
+                thread.start()
+                thread.join()
+
+                if error[0]:
+                    raise error[0]
+
+            except RuntimeError:
+                asyncio.run(builder.build())
+
+            print("\n" + "="*70)
+            print("✅ VectorDB 구축 완료!")
+            print("="*70 + "\n")
+
+            return True
+
+        except Exception as e:
+            print("\n" + "="*70)
+            print("❌ VectorDB 구축 실패")
+            print("="*70)
+            print(f"\n에러: {e}")
+            print("\n💡 수동 구축:")
+            print("   python -m Data.VectorBuilder")
+            print("\n" + "="*70 + "\n")
+
+            import traceback
+            if self.verbose:
+                print("\n상세 에러:")
+                traceback.print_exc()
+
+            return False
+
+    def _ask_user_to_build(self) -> bool:
+        """사용자에게 VectorDB 구축 여부 물어보기"""
+        print("\n" + "="*70)
+        print("🔨 VectorDB 구축 필요")
+        print("="*70)
+        print("\n📊 구축 정보:")
+        print("   • 데이터: 110만개 한국어 사전 항목")
+        print("   • 소요 시간: 80-100분 (ultra_conservative)")
+        print("   • 메모리: ~4GB 피크")
+        print("   • 1회만 구축하면 재사용 가능")
+        print("\n" + "="*70)
+
+        while True:
+            response = input("\n🤔 지금 VectorDB를 구축하시겠습니까? (y/n): ").strip().lower()
+
+            if response in ['y', 'yes', '예', 'ㅇ']:
+                return True
+            elif response in ['n', 'no', '아니오', 'ㄴ']:
+                return False
+            else:
+                print("   ⚠️  'y' 또는 'n'을 입력해주세요.")
+
+    def _ensure_vectordb_ready(self):
+        """VectorDB 준비 상태 확인 및 필요 시 구축/복구"""
+        exists, status = self._check_vectordb_exists()
+
+        if exists and status == "완전":
+            return
+
+        if status == "인덱스없음":
+            if self.auto_build is False:
+                print("\n" + "="*70)
+                print("❌ VectorDB 인덱스가 생성되지 않았습니다")
+                print("="*70)
+                print("\n데이터는 있지만 인덱스가 없어 검색할 수 없습니다.")
+                print("\n💡 해결방법:")
+                print("   1. 인덱스 생성: auto_build=True")
+                print("   2. 수동 구축: python -m Data.VectorBuilder")
+                print("\n" + "="*70 + "\n")
+                raise RuntimeError("VectorDB index not found")
+
+            elif self.auto_build is True:
+                if self.verbose:
+                    print("\n🔨 VectorDB 인덱스 자동 생성 모드")
+                success = self._create_index_only()
+                if not success:
+                    print("\n⚠️  인덱스 생성 실패, 재구축을 시도합니다...")
+                    success = self._delete_and_rebuild()
+                    if not success:
+                        raise RuntimeError("VectorDB rebuild failed")
+
+            else:  # auto_build is None
+                choice = self._ask_user_for_index_fix()
+
+                if choice == "index":
+                    success = self._create_index_only()
+                    if not success:
+                        print("\n💡 인덱스 생성에 실패했습니다.")
+                        print("   재구축을 시도하시겠습니까?")
+                        retry = input("   (y/n): ").strip().lower()
+
+                        if retry in ['y', 'yes']:
+                            success = self._delete_and_rebuild()
+                            if not success:
+                                raise RuntimeError("VectorDB rebuild failed")
+                        else:
+                            raise RuntimeError("VectorDB index creation failed")
+
+                elif choice == "rebuild":
+                    success = self._delete_and_rebuild()
+                    if not success:
+                        raise RuntimeError("VectorDB rebuild failed")
+
+                else:
+                    print("\n" + "="*70)
+                    print("⏸️  VectorDB 복구 건너뜀")
+                    print("="*70)
+                    print("\n💡 나중에 복구:")
+                    print("   python -m Data.VectorBuilder")
+                    print("\n⚠️  검색 기능은 VectorDB 복구 후 사용 가능합니다.")
+                    print("="*70 + "\n")
+                    raise RuntimeError("VectorDB fix skipped by user")
+
+        else:
+            if self.auto_build is False:
+                print("\n" + "="*70)
+                print("❌ VectorDB가 구축되지 않았습니다")
+                print("="*70)
+                print(f"\n상태: {status}")
+                print("\n💡 구축 방법:")
+                print("   1. 수동 구축: python -m Data.VectorBuilder")
+                print("   2. 자동 구축: TextProcessing(auto_build=True)")
+                print("\n" + "="*70 + "\n")
+                raise RuntimeError("VectorDB not found")
+
+            elif self.auto_build is True:
+                if self.verbose:
+                    print("\n🔨 VectorDB 자동 구축 모드")
+                success = self._build_vectordb()
+                if not success:
+                    raise RuntimeError("VectorDB build failed")
+
+            else:  # auto_build is None
+                should_build = self._ask_user_to_build()
+
+                if should_build:
+                    success = self._build_vectordb()
+                    if not success:
+                        raise RuntimeError("VectorDB build failed")
+                else:
+                    print("\n" + "="*70)
+                    print("⏸️  VectorDB 구축 건너뜀")
+                    print("="*70)
+                    print("\n💡 나중에 구축:")
+                    print("   python -m Data.VectorBuilder")
+                    print("\n⚠️  검색 기능은 VectorDB 구축 후 사용 가능합니다.")
+                    print("="*70 + "\n")
+                    raise RuntimeError("VectorDB build skipped by user")
+
+    # ============================================
+    # 발음 정제
+    # ============================================
+
+    def clean_dysarthric_input(
+        self,
+        text: str,
+        confidence_threshold: float = 0.7
+    ) -> CleanedText:
+        """불명확한 발음 입력 정제"""
+        original = text
+        cleaned = text
+        changes = []
+        confidence = 1.0
+
+        if 'ㄴ' in text and len(text) > 1:
+            cleaned = text.replace('ㄴ', 'n')
+            changes.append((text, cleaned))
+            confidence = 0.85
+
+        return CleanedText(
+            original_text=original,
+            cleaned_text=cleaned,
+            confidence=confidence,
+            changes=changes
+        )
+
+    # ============================================
+    # Dysarthric 검색 (메모리 최적화)
+    # ============================================
+
+    def dysarthric_search_pipeline(
+        self,
+        query: str,
+        top_k: int = 5,
+        use_pronunciation: bool = True,
+        rerank: bool = True
+    ) -> List[SearchResult]:
+        """Dysarthric speech 검색 파이프라인"""
+        if self.monitor_memory:
+            print_memory_usage("검색 시작")
+
+        cleaned = self.clean_dysarthric_input(query)
+        search_query = cleaned.cleaned_text
+
+        results = self.search_engine.search(search_query, top_k=top_k * 2)
+
+        if use_pronunciation and rerank:
+            results = self._rerank_by_pronunciation(
+                results,
+                search_query,
+                cleaned.confidence
             )
 
-            entities = [
-                {"word": w, "definition": d, "semantic_vector": v}
-                for w, d, v in zip(words, definitions, vectors)
-            ]
+        final_results = results[:top_k]
 
-            insert_task = partial(milvus_client.insert, collection_name=COLLECTION_NAME, data=entities)
-            await asyncio.get_running_loop().run_in_executor(executor, insert_task)
-            processed_count += len(batch_data)
+        search_results = []
+        for r in final_results:
+            search_results.append(SearchResult(
+                word=r['word'],
+                definition=r['definition'],
+                pos=r['pos'],
+                pronunciation=r['pronunciation'],
+                semantic_score=r['similarity'],
+                pronunciation_score=r.get('pronunciation_score', 0.0),
+                combined_score=r.get('combined_score', r['similarity']),
+                confidence=self._get_confidence_level(
+                    r.get('combined_score', r['similarity'])
+                ),
+                similar_words=r.get('similar_words', []),
+                parent_words=r.get('parent_words', [])
+            ))
 
-        except Exception as e:
-            print(f"[{name}] 처리 중 오류 발생: {e}")
-            break
+        del results
+        del final_results
 
-    if processed_count > 0:
-        print(f"[{name}]이 총 {processed_count}개의 데이터를 처리하고 종료합니다.")
+        if self.monitor_memory:
+            print_memory_usage("검색 후 (정리 전)")
+
+        gc.collect()
+
+        if self.monitor_memory:
+            print_memory_usage("검색 후 (정리 완료)")
+
+        return search_results
+
+    def _rerank_by_pronunciation(
+        self,
+        results: List[Dict],
+        query: str,
+        input_confidence: float
+    ) -> List[Dict]:
+        """발음 기반 재순위화"""
+        for r in results:
+            pron_score = self._calculate_pronunciation_similarity(
+                query,
+                r['pronunciation']
+            )
+            r['pronunciation_score'] = pron_score
 
 
-# --- 3. 메인 실행 로직 ---
+            r['combined_score'] = (
+                r['similarity'] * (1 - PRONUNCIATION_WEIGHT) +
+                pron_score * PRONUNCIATION_WEIGHT
+            )
 
-async def main():
-    # 0. Milvus 클라이언트 및 모델 로드
-    print("Milvus 서버에 연결 시도 중...")
-    milvus_client = MilvusClient(uri=MILVUS_URI)
-    print("Milvus 서버에 성공적으로 연결되었습니다!")
+        results.sort(key=lambda x: x['combined_score'], reverse=True)
 
-    print(f"의미 분석용 언어 모델 '{MODEL_NAME}'을(를) 로드합니다...")
-    semantic_model = SentenceTransformer(MODEL_NAME)
-    VECTOR_DIMENSION = semantic_model.get_sentence_embedding_dimension()
-    print(f"모델 로드 완료! 벡터 차원: {VECTOR_DIMENSION}")
+        return results
 
-    # 1. Milvus 컬렉션 준비
-    if milvus_client.has_collection(collection_name=COLLECTION_NAME):
-        milvus_client.drop_collection(collection_name=COLLECTION_NAME)
-        print(f"기존 컬렉션 '{COLLECTION_NAME}'을(를) 삭제했습니다.")
+    def _calculate_pronunciation_similarity(
+        self,
+        text1: str,
+        text2: str
+    ) -> float:
+        """발음 유사도 계산"""
+        if not text1 or not text2:
+            return 0.0
 
-    fields = [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-        FieldSchema(name="word", dtype=DataType.VARCHAR, max_length=500),
-        FieldSchema(name="definition", dtype=DataType.VARCHAR, max_length=2000),
-        FieldSchema(name="semantic_vector", dtype=DataType.FLOAT_VECTOR, dim=VECTOR_DIMENSION)
-    ]
-    schema = CollectionSchema(fields, description="비동기 처리된 의미 벡터 DB")
-    milvus_client.create_collection(collection_name=COLLECTION_NAME, schema=schema)
-    print(f"컬렉션 '{COLLECTION_NAME}' 생성 완료.")
+        common = set(text1) & set(text2)
+        total = set(text1) | set(text2)
 
-    # 2. 비동기 작업 환경 설정
-    queue = asyncio.Queue(maxsize=BATCH_SIZE * 5)
-    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    executor = ThreadPoolExecutor()
+        return len(common) / len(total) if total else 0.0
 
-    # 3. 생산자(Producer)와 소비자(Consumer) 태스크 생성
-    file_list = get_json_file_list()
-    if not file_list:
-        print(f"'{DATA_DIR}' 디렉토리에서 JSON 파일을 찾을 수 없습니다. 경로를 확인해주세요.")
-        return
+    def _get_confidence_level(self, score: float) -> str:
+        """신뢰도 레벨"""
 
-    producer_tasks = [producer(file_path, queue, semaphore) for file_path in file_list]
-    # 💡 [핵심 수정] 각 소비자에게 고유한 이름을 부여하여 로그 추적 용이
-    consumer_tasks = [consumer(f"Consumer-{i + 1}", queue, milvus_client, semantic_model, executor) for i in
-                      range(CONSUMER_COUNT)]
 
-    # 4. 태스크 실행 및 대기
-    print(f"총 {len(file_list)}개의 파일을 처리합니다...")
-    # 💡 [핵심 수정] 생산자와 소비자를 동시에 실행
-    producers_future = asyncio.gather(*producer_tasks)
-    consumers_future = asyncio.gather(*consumer_tasks)
+        if MIN_CONFIDENCE == "high":
+            threshold_high = 0.8
+            threshold_medium = 0.6
+        elif MIN_CONFIDENCE == "medium":
+            threshold_high = 0.7
+            threshold_medium = 0.5
+        else:
+            threshold_high = 0.6
+            threshold_medium = 0.4
 
-    # 모든 생산자 작업이 끝날 때까지 대기
-    await producers_future
-    print("모든 파일 읽기 및 파싱 완료.")
+        if score >= threshold_high:
+            return "high"
+        elif score >= threshold_medium:
+            return "medium"
+        else:
+            return "low"
 
-    # 💡 [핵심 수정] 생산자가 모두 끝나면, 소비자에게 종료 신호(None)를 보냄
-    for _ in range(CONSUMER_COUNT):
-        await queue.put(None)
 
-    # 모든 소비자가 종료 신호를 받고 작업을 마칠 때까지 대기
-    await consumers_future
-    print("모든 데이터 삽입 완료.")
+# ============================================
+# 메인 실행
+# ============================================
 
-    # 5. 인덱스 생성 및 연결 종료
-    print("데이터 플러시 및 인덱스 생성을 시작합니다...")
-    milvus_client.flush(COLLECTION_NAME)
+def main():
+    """예시 실행"""
+    print("="*70)
+    print("🎙️  TextProcessing 예시 실행")
+    print("="*70 + "\n")
 
-    index_params = milvus_client.prepare_index_params()
-    index_params.add_index(
-        field_name="semantic_vector",
-        index_type="HNSW",
-        metric_type="COSINE",  # SBERT 계열은 COSINE 권장
-        params={"M": 16, "efConstruction": 200}
-    )
-    milvus_client.create_index(COLLECTION_NAME, index_params=index_params)
+    try:
+        with TextProcessing(verbose=True, auto_build=None, monitor_memory=True) as processor:
+            print("\n" + "="*70)
+            print("예시: 기본 기능 테스트")
+            print("="*70 + "\n")
 
-    # 검색/쿼리 전에 로드 (이제 index not found 안 납니다)
-    milvus_client.load_collection(COLLECTION_NAME)
+            print("1. 불명확한 발음 정제")
+            print("-" * 70)
 
-    # 헬스체크(닫기 전)
-    print("\n[Health Check]")
-    # print("describe_index:", milvus_client.describe_index
-    # (COLLECTION_NAME))
-    # print("stats:", milvus_client.get_collection_stats(COLLECTION_NAME))
-    # print("sample:", milvus_client.query(
-    #     collection_name=COLLECTION_NAME,
-    #     filter="",
-    #     limit=5,
-    #     output_fields=["id", "word", "definition"]
-    # ))
+            test_inputs = ["하ㄴ글", "컴퓨터", "사ㄹ랑"]
 
-    print("\n모든 작업이 완료되었습니다!")
-    # print("\n[Health Check] ----------")
-    # print("collections:", milvus_client.list_collections())  # 컬렉션 존재 확인
-    # print("describe:", milvus_client.describe_collection(COLLECTION_NAME))  # 스키마/인덱스 확인
-    # print("stats (row_count may be 0 while streaming):", milvus_client.get_collection_stats(COLLECTION_NAME))
-    #
-    # # 실제 엔티티 샘플 조회: filter="" + limit 사용
-    # try:
-    #     sample = milvus_client.query(
-    #         collection_name=COLLECTION_NAME,
-    #         filter="",
-    #         limit=5,
-    #         output_fields=["id", "word", "definition"]
-    #     )
-    #     print("query sample:", sample)
-    # except Exception as e:
-    #     print("query error:", e)
+            for text in test_inputs:
+                cleaned = processor.clean_dysarthric_input(text)
+                print(f"입력: '{cleaned.original_text}'")
+                print(f"정제: '{cleaned.cleaned_text}'")
+                print(f"신뢰도: {cleaned.confidence:.2f}")
+                print()
 
-    milvus_client.close()
+            print("\n2. Dysarthric 검색 파이프라인")
+            print("-" * 70 + "\n")
 
-    #----------------
-    check = MilvusClient(uri=MILVUS_URI)  # 필요하면 db_name="default" 도 명시
-    print("\n[Health Check - new client]")
-    print("collections:", check.list_collections())
-    print("describe:", check.describe_collection(COLLECTION_NAME))
-    print("stats:", check.get_collection_stats(COLLECTION_NAME))
-    print("sample:", check.query(
-        collection_name=COLLECTION_NAME,
-        filter="",
-        limit=5,
-        output_fields=["id", "word", "definition"]
-    ))
-    check.close()
-    #---------------
-    executor.shutdown()
+            results = processor.dysarthric_search_pipeline(
+                "한글",
+                top_k=5,
+                use_pronunciation=True,
+                rerank=True
+            )
+
+            for i, r in enumerate(results, 1):
+                print(f"{i}. {r.word} ({r.pos})")
+                print(f"   의미: {r.semantic_score:.3f} | "
+                      f"발음: {r.pronunciation_score:.3f} | "
+                      f"통합: {r.combined_score:.3f}")
+                print(f"   신뢰도: {r.confidence}")
+                print()
+
+            print("="*70)
+            print("✅ 테스트 완료!")
+            print("="*70 + "\n")
+
+    except RuntimeError as e:
+        error_msg = str(e)
+
+        if "skipped by user" in error_msg:
+            print("\n💡 Tip:")
+            print("   VectorDB 없이도 기본 기능(발음 정제)은 테스트 가능합니다:")
+            print()
+
+        elif "not found" in error_msg or "index" in error_msg:
+            print("\n💡 해결방법:")
+            print("   1. 자동 구축: processor = TextProcessing(auto_build=True)")
+            print("   2. 수동 구축: python -m Data.VectorBuilder")
+            print()
+
+        else:
+            print(f"\n❌ 에러: {e}\n")
+
+    except Exception as e:
+        print(f"\n❌ 예상치 못한 에러: {e}\n")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
-    import time
-
-    start = time.time()
-    asyncio.run(main())
-    end = time.time()
-
-    #5만개의 데이터를 저장할때 166초가 걸림 즉 1초당 만 번 가동,
-    # 시간 복잡도: 임베딩 생성 O(N·L²), 인덱스 빌드 O(N·M·logN) 총: O(N·L²) + O(N·M·logN)
-    # 나중에 발음 벡터(phn_vec) 추가 시도해도 총합은 O(N·(L² + M·logN)) 스케일 유지됨.
-
-    print(end - start)
+    main()

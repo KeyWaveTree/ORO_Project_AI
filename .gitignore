@@ -4,7 +4,8 @@
 __pycache__/
 *.pyc
 
-
 /Data/검증.py
 
-/Data/SamInKorean/*
+SamInKorean/*
+
+.env

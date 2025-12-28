@@ -1,25 +1,167 @@
-from typing import Dict
-import requests
+from dataclasses import dataclass
+from typing import Optional
+from enum import Enum
 
-class ConnectionHandler:
-    """서버와의 저수준(low-level) 통신을 시뮬레이션하는 내부 클래스"""
-    def __init__(self, host: str, port: int):
-        self._base_url = f"http://{host}:{port}"
-        print(f"🔩 내부 핸들러: 서버 주소 {self._base_url} 로 요청을 보낼 준비 완료.")
+from .Transport import Transport, HTTPTransport, TransportProtocol, RetryableTransport
 
-    def post(self, endpoint: str, payload: Dict) -> Dict:
-        full_url = self._base_url + endpoint
+
+class ConnectionState(Enum):
+    """연결 상태"""
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    CONNECTED = "connected"
+    ERROR = "error"
+
+
+@dataclass
+class ConnectionConfig:
+    """
+    연결 설정
+
+    Attributes:
+        host: 호스트
+        port: 포트
+        protocol: 프로토콜
+        timeout: 타임아웃
+        max_retries: 최대 재시도
+        auth_token: 인증 토큰
+        ssl_verify: SSL 검증
+    """
+
+    host: str = "localhost"
+    port: int = 19530
+    protocol: TransportProtocol = TransportProtocol.HTTP
+    timeout: int = 30
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    auth_token: Optional[str] = None
+    ssl_verify: bool = True
+
+    def get_base_url(self) -> str:
+        """기본 URL 생성"""
+        protocol_str = "https" if self.ssl_verify else "http"
+        return f"{protocol_str}://{self.host}:{self.port}"
+
+
+class Connection:
+    """
+    연결 관리자
+
+    역할:
+    - Transport 생성 및 관리
+    - 연결 상태 관리
+    - Health check
+    """
+
+    def __init__(self, config: ConnectionConfig):
+        """
+        Args:
+            config: 연결 설정
+        """
+        self.config = config
+        self.transport: Optional[Transport] = None
+        self.state = ConnectionState.DISCONNECTED
+
+    def connect(self):
+        """연결"""
+        from Exceptions import ConnectionError
+
+        self.state = ConnectionState.CONNECTING
+
         try:
-            print(f"  -> 🌐 {full_url} 로 실제 네트워크 POST 요청 전송...")
-            # requests.post를 사용해 JSON 페이로드와 함께 실제 HTTP 요청을 보냄
-            response = requests.post(full_url, json=payload, timeout=5)  # 5초 타임아웃
-            response.raise_for_status()  # 200번대 성공 코드가 아니면 에러 발생
+            # Transport 생성
+            base_transport = HTTPTransport(
+                base_url=self.config.get_base_url(),
+                default_timeout=self.config.timeout,
+                default_headers=self._get_headers(),
+                verify_ssl=self.config.ssl_verify
+            )
 
-            print("  <- ✅실제 네트워크 응답 수신!")
-            return response.json()  # 응답 본문을 JSON(dict)으로 변환하여 반환
+            # 재시도 래퍼
+            self.transport = RetryableTransport(
+                transport=base_transport,
+                max_retries=self.config.max_retries,
+                retry_delay=self.config.retry_delay
+            )
 
-        except requests.exceptions.RequestException as e:
-            print(f"  <-❌네트워크 오류 발생: {e}")
-            return {"error": str(e)}
+            # Health check
+            self.health_check()
+
+            self.state = ConnectionState.CONNECTED
+            print(f"✅ Connected to {self.config.host}:{self.config.port}")
+
+        except Exception as e:
+            self.state = ConnectionState.ERROR
+            raise ConnectionError(f"Failed to connect: {str(e)}")
+
+    def disconnect(self):
+        """연결 해제"""
+        if self.transport:
+            self.transport.close()
+            self.transport = None
+
+        self.state = ConnectionState.DISCONNECTED
+        print("🔌 Disconnected")
+
+    def health_check(self) -> bool:
+        """Health check"""
+        try:
+            # 실제로는 /health 엔드포인트 호출
+            # 여기서는 간단히 통과
+            return True
+        except Exception:
+            return False
+
+    def is_connected(self) -> bool:
+        """연결 상태 확인"""
+        return self.state == ConnectionState.CONNECTED
+
+    def send(self, method: str, endpoint: str, payload=None) -> dict:
+        """요청 전송"""
+        if not self.is_connected():
+            raise ConnectionError("Not connected")
+
+        return self.transport.send(method, endpoint, payload)
+
+    def _get_headers(self) -> dict:
+        """헤더 생성"""
+        headers = {"Content-Type": "application/json"}
+
+        if self.config.auth_token:
+            headers["Authorization"] = f"Bearer {self.config.auth_token}"
+
+        return headers
+
+    def __enter__(self):
+        """Context manager"""
+        if not self.is_connected():
+            self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager"""
+        self.disconnect()
 
 
+if __name__ == "__main__":
+    print("=" * 60)
+    print("Connection 테스트")
+    print("=" * 60)
+
+    # 설정 생성
+    config = ConnectionConfig(
+        host="localhost",
+        port=19530,
+        timeout=5
+    )
+
+    print(f"✅ ConnectionConfig: {config.get_base_url()}")
+
+    # 연결 생성
+    conn = Connection(config)
+    print(f"✅ Connection created: state={conn.state.value}")
+
+    # Context manager
+    # with Connection(config) as conn:
+    #     # 작업 수행
+    #     pass
